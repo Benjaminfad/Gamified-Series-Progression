@@ -10,6 +10,7 @@
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u108))
 (define-constant ERR_REWARD_ALREADY_CLAIMED (err u109))
 (define-constant ERR_NO_WINNING_VOTE (err u110))
+(define-constant ERR_ANALYTICS_NOT_FOUND (err u111))
 
 (define-constant BASE_REPUTATION_REWARD u50)
 (define-constant STREAK_BONUS_MULTIPLIER u25)
@@ -22,6 +23,9 @@
 (define-data-var voting-duration uint u144)
 (define-data-var total-reputation-distributed uint u0)
 (define-data-var reward-pool-balance uint u100000)
+(define-data-var total-votes-cast uint u0)
+(define-data-var total-episodes-completed uint u0)
+(define-data-var total-unique-voters uint u0)
 
 (define-map token-balances principal uint)
 (define-map episodes 
@@ -80,6 +84,50 @@
         voting-weight-multiplier: uint,
         early-access: bool,
         bonus-token-rate: uint
+    }
+)
+
+(define-map episode-analytics
+    uint
+    {
+        total-participants: uint,
+        total-tokens-voted: uint,
+        winning-margin: uint,
+        consensus-strength: uint,
+        average-vote-size: uint,
+        completion-timestamp: uint
+    }
+)
+
+(define-map branch-analytics
+    {episode-id: uint, branch-id: uint}
+    {
+        vote-percentage: uint,
+        unique-voters: uint,
+        largest-single-vote: uint,
+        average-vote-weight: uint
+    }
+)
+
+(define-map user-voting-history
+    principal
+    {
+        episodes-participated: uint,
+        total-tokens-voted: uint,
+        win-rate: uint,
+        average-vote-size: uint,
+        favorite-branch-type: uint,
+        first-vote-episode: uint
+    }
+)
+
+(define-map community-metrics
+    uint
+    {
+        active-voters-count: uint,
+        engagement-rate: uint,
+        average-consensus: uint,
+        total-activity: uint
     }
 )
 
@@ -156,6 +204,8 @@
         )
         
         (add-participant episode-id tx-sender)
+        (unwrap-panic (update-voting-analytics tx-sender episode-id branch-id token-amount))
+        (var-set total-votes-cast (+ (var-get total-votes-cast) u1))
         (ok true)
     )
 )
@@ -191,6 +241,8 @@
         )
         
         (try! (batch-calculate-rewards episode-id))
+        (try! (finalize-episode-analytics episode-id))
+        (var-set total-episodes-completed (+ (var-get total-episodes-completed) u1))
         (ok winning-branch)
     )
 )
@@ -502,6 +554,196 @@
 (define-read-only (has-early-access (user principal))
     (get early-access (default-to {voting-weight-multiplier: u100, early-access: false, bonus-token-rate: u0}
                         (map-get? user-privileges user)))
+)
+
+(define-private (update-voting-analytics (voter principal) (episode-id uint) (branch-id uint) (token-amount uint))
+    (let (
+        (user-history (default-to 
+            {episodes-participated: u0, total-tokens-voted: u0, win-rate: u0, average-vote-size: u0, favorite-branch-type: u0, first-vote-episode: u0}
+            (map-get? user-voting-history voter)))
+        (is-first-vote (is-eq (get episodes-participated user-history) u0))
+    )
+        (map-set user-voting-history voter
+            {
+                episodes-participated: (+ (get episodes-participated user-history) u1),
+                total-tokens-voted: (+ (get total-tokens-voted user-history) token-amount),
+                win-rate: (get win-rate user-history),
+                average-vote-size: (/ (+ (get total-tokens-voted user-history) token-amount) (+ (get episodes-participated user-history) u1)),
+                favorite-branch-type: branch-id,
+                first-vote-episode: (if is-first-vote episode-id (get first-vote-episode user-history))
+            })
+        (ok true)
+    )
+)
+
+(define-private (finalize-episode-analytics (episode-id uint))
+    (let (
+        (episode-info (unwrap! (map-get? episodes episode-id) ERR_EPISODE_NOT_FOUND))
+        (participants (get-episode-participants episode-id))
+        (participant-count (len participants))
+        (total-tokens (get total-votes episode-info))
+        (avg-vote (if (> participant-count u0) (/ total-tokens participant-count) u0))
+        (winner (unwrap! (get winner-branch episode-info) ERR_NO_WINNING_VOTE))
+        (winner-votes (get vote-count (unwrap! (map-get? episode-branches {episode-id: episode-id, branch-id: winner}) ERR_BRANCH_NOT_FOUND)))
+        (consensus (if (> total-tokens u0) (/ (* winner-votes u100) total-tokens) u0))
+    )
+        (map-set episode-analytics episode-id
+            {
+                total-participants: participant-count,
+                total-tokens-voted: total-tokens,
+                winning-margin: winner-votes,
+                consensus-strength: consensus,
+                average-vote-size: avg-vote,
+                completion-timestamp: stacks-block-height
+            })
+        
+        (try! (calculate-branch-analytics episode-id u1))
+        (try! (calculate-branch-analytics episode-id u2))
+        (try! (calculate-branch-analytics episode-id u3))
+        (try! (update-community-metrics episode-id))
+        (ok true)
+    )
+)
+
+(define-private (calculate-branch-analytics (episode-id uint) (branch-id uint))
+    (let (
+        (branch-info (map-get? episode-branches {episode-id: episode-id, branch-id: branch-id}))
+        (episode-info (unwrap! (map-get? episodes episode-id) ERR_EPISODE_NOT_FOUND))
+    )
+        (match branch-info
+            branch-data
+            (let (
+                (total-votes (get total-votes episode-info))
+                (branch-votes (get vote-count branch-data))
+                (vote-pct (if (> total-votes u0) (/ (* branch-votes u100) total-votes) u0))
+            )
+                (map-set branch-analytics {episode-id: episode-id, branch-id: branch-id}
+                    {
+                        vote-percentage: vote-pct,
+                        unique-voters: u0,
+                        largest-single-vote: u0,
+                        average-vote-weight: u0
+                    })
+                (ok true)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-private (update-community-metrics (episode-id uint))
+    (let (
+        (participants (get-episode-participants episode-id))
+        (participant-count (len participants))
+        (episode-analytics-data (unwrap! (map-get? episode-analytics episode-id) ERR_ANALYTICS_NOT_FOUND))
+        (consensus (get consensus-strength episode-analytics-data))
+    )
+        (map-set community-metrics episode-id
+            {
+                active-voters-count: participant-count,
+                engagement-rate: u100,
+                average-consensus: consensus,
+                total-activity: (get total-tokens-voted episode-analytics-data)
+            })
+        (ok true)
+    )
+)
+
+(define-read-only (get-episode-analytics (episode-id uint))
+    (map-get? episode-analytics episode-id)
+)
+
+(define-read-only (get-branch-analytics (episode-id uint) (branch-id uint))
+    (map-get? branch-analytics {episode-id: episode-id, branch-id: branch-id})
+)
+
+(define-read-only (get-user-voting-history (user principal))
+    (map-get? user-voting-history user)
+)
+
+(define-read-only (get-community-metrics (episode-id uint))
+    (map-get? community-metrics episode-id)
+)
+
+(define-read-only (get-platform-statistics)
+    (ok {
+        total-votes-cast: (var-get total-votes-cast),
+        total-episodes-completed: (var-get total-episodes-completed),
+        total-unique-voters: (var-get total-unique-voters),
+        total-reputation-distributed: (var-get total-reputation-distributed),
+        reward-pool-balance: (var-get reward-pool-balance)
+    })
+)
+
+(define-read-only (get-episode-comparison (episode-id-1 uint) (episode-id-2 uint))
+    (let (
+        (analytics-1 (map-get? episode-analytics episode-id-1))
+        (analytics-2 (map-get? episode-analytics episode-id-2))
+    )
+        (ok {
+            episode-1: analytics-1,
+            episode-2: analytics-2,
+            participation-diff: (if (and (is-some analytics-1) (is-some analytics-2))
+                (if (> (get total-participants (unwrap-panic analytics-1)) (get total-participants (unwrap-panic analytics-2)))
+                    (- (get total-participants (unwrap-panic analytics-1)) (get total-participants (unwrap-panic analytics-2)))
+                    (- (get total-participants (unwrap-panic analytics-2)) (get total-participants (unwrap-panic analytics-1))))
+                u0)
+        })
+    )
+)
+
+(define-read-only (get-branch-popularity-ranking (episode-id uint))
+    (let (
+        (branch-1 (map-get? branch-analytics {episode-id: episode-id, branch-id: u1}))
+        (branch-2 (map-get? branch-analytics {episode-id: episode-id, branch-id: u2}))
+        (branch-3 (map-get? branch-analytics {episode-id: episode-id, branch-id: u3}))
+    )
+        (ok {
+            branch-1-percentage: (if (is-some branch-1) (get vote-percentage (unwrap-panic branch-1)) u0),
+            branch-2-percentage: (if (is-some branch-2) (get vote-percentage (unwrap-panic branch-2)) u0),
+            branch-3-percentage: (if (is-some branch-3) (get vote-percentage (unwrap-panic branch-3)) u0)
+        })
+    )
+)
+
+(define-read-only (get-user-engagement-score (user principal))
+    (let (
+        (history (map-get? user-voting-history user))
+        (reputation (get-user-reputation-data user))
+    )
+        (match history
+            user-data
+            (ok {
+                participation-score: (* (get episodes-participated user-data) u10),
+                accuracy-score: (get-voting-accuracy user),
+                reputation-score: (get total-reputation reputation),
+                total-engagement: (+ (* (get episodes-participated user-data) u10) (get total-reputation reputation))
+            })
+            (ok {
+                participation-score: u0,
+                accuracy-score: u0,
+                reputation-score: (get total-reputation reputation),
+                total-engagement: u0
+            })
+        )
+    )
+)
+
+(define-read-only (get-consensus-trend (start-episode uint) (end-episode uint))
+    (let (
+        (start-analytics (map-get? episode-analytics start-episode))
+        (end-analytics (map-get? episode-analytics end-episode))
+    )
+        (ok {
+            start-consensus: (if (is-some start-analytics) (get consensus-strength (unwrap-panic start-analytics)) u0),
+            end-consensus: (if (is-some end-analytics) (get consensus-strength (unwrap-panic end-analytics)) u0),
+            trend-direction: (if (and (is-some start-analytics) (is-some end-analytics))
+                (if (> (get consensus-strength (unwrap-panic end-analytics)) (get consensus-strength (unwrap-panic start-analytics)))
+                    "increasing"
+                    "decreasing")
+                "unknown")
+        })
+    )
 )
 
 (map-set token-balances CONTRACT_OWNER (var-get total-token-supply))
