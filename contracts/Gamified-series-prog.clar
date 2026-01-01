@@ -11,6 +11,10 @@
 (define-constant ERR_REWARD_ALREADY_CLAIMED (err u109))
 (define-constant ERR_NO_WINNING_VOTE (err u110))
 (define-constant ERR_ANALYTICS_NOT_FOUND (err u111))
+(define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u112))
+(define-constant ERR_DELEGATION_EXISTS (err u113))
+(define-constant ERR_NO_DELEGATION (err u114))
+(define-constant ERR_DELEGATE_ALREADY_VOTED (err u115))
 
 (define-constant BASE_REPUTATION_REWARD u50)
 (define-constant STREAK_BONUS_MULTIPLIER u25)
@@ -128,6 +132,23 @@
         engagement-rate: uint,
         average-consensus: uint,
         total-activity: uint
+    }
+)
+
+(define-map vote-delegations
+    principal
+    {
+        delegate: principal,
+        token-amount: uint,
+        is-active: bool
+    }
+)
+
+(define-map delegated-power
+    principal
+    {
+        total-delegated-tokens: uint,
+        delegator-count: uint
     }
 )
 
@@ -743,6 +764,106 @@
                     "decreasing")
                 "unknown")
         })
+    )
+)
+
+(define-public (delegate-votes (delegate principal) (token-amount uint))
+    (let (
+        (delegator-balance (default-to u0 (map-get? token-balances tx-sender)))
+        (existing-delegation (map-get? vote-delegations tx-sender))
+        (delegate-power (default-to {total-delegated-tokens: u0, delegator-count: u0} (map-get? delegated-power delegate)))
+    )
+        (asserts! (not (is-eq tx-sender delegate)) ERR_CANNOT_DELEGATE_TO_SELF)
+        (asserts! (is-none existing-delegation) ERR_DELEGATION_EXISTS)
+        (asserts! (>= delegator-balance token-amount) ERR_INSUFFICIENT_TOKENS)
+        
+        (map-set vote-delegations tx-sender
+            {
+                delegate: delegate,
+                token-amount: token-amount,
+                is-active: true
+            }
+        )
+        
+        (map-set delegated-power delegate
+            {
+                total-delegated-tokens: (+ (get total-delegated-tokens delegate-power) token-amount),
+                delegator-count: (+ (get delegator-count delegate-power) u1)
+            }
+        )
+        
+        (map-set token-balances tx-sender (- delegator-balance token-amount))
+        (ok true)
+    )
+)
+
+(define-public (revoke-delegation)
+    (let (
+        (delegation (unwrap! (map-get? vote-delegations tx-sender) ERR_NO_DELEGATION))
+        (delegate (get delegate delegation))
+        (token-amount (get token-amount delegation))
+        (delegate-power (default-to {total-delegated-tokens: u0, delegator-count: u0} (map-get? delegated-power delegate)))
+        (current-balance (default-to u0 (map-get? token-balances tx-sender)))
+    )
+        (map-delete vote-delegations tx-sender)
+        
+        (map-set delegated-power delegate
+            {
+                total-delegated-tokens: (- (get total-delegated-tokens delegate-power) token-amount),
+                delegator-count: (- (get delegator-count delegate-power) u1)
+            }
+        )
+        
+        (map-set token-balances tx-sender (+ current-balance token-amount))
+        (ok true)
+    )
+)
+
+(define-public (vote-with-delegated-power (episode-id uint) (branch-id uint))
+    (let (
+        (episode-info (unwrap! (map-get? episodes episode-id) ERR_EPISODE_NOT_FOUND))
+        (delegate-power (default-to {total-delegated-tokens: u0, delegator-count: u0} (map-get? delegated-power tx-sender)))
+        (delegated-tokens (get total-delegated-tokens delegate-power))
+        (current-vote (map-get? user-votes {voter: tx-sender, episode-id: episode-id}))
+        (branch-info (unwrap! (map-get? episode-branches {episode-id: episode-id, branch-id: branch-id}) ERR_BRANCH_NOT_FOUND))
+    )
+        (asserts! (get is-active episode-info) ERR_VOTING_CLOSED)
+        (asserts! (<= stacks-block-height (get voting-end episode-info)) ERR_VOTING_CLOSED)
+        (asserts! (> delegated-tokens u0) ERR_INSUFFICIENT_TOKENS)
+        (asserts! (is-none current-vote) ERR_DELEGATE_ALREADY_VOTED)
+        
+        (map-set user-votes {voter: tx-sender, episode-id: episode-id}
+            {branch-id: branch-id, token-amount: delegated-tokens}
+        )
+        
+        (map-set episode-branches {episode-id: episode-id, branch-id: branch-id}
+            (merge branch-info {vote-count: (+ (get vote-count branch-info) delegated-tokens)})
+        )
+        
+        (map-set episodes episode-id
+            (merge episode-info {total-votes: (+ (get total-votes episode-info) delegated-tokens)})
+        )
+        
+        (add-participant episode-id tx-sender)
+        (var-set total-votes-cast (+ (var-get total-votes-cast) u1))
+        (ok true)
+    )
+)
+
+(define-read-only (get-delegation (delegator principal))
+    (map-get? vote-delegations delegator)
+)
+
+(define-read-only (get-delegated-power (delegate principal))
+    (default-to {total-delegated-tokens: u0, delegator-count: u0} (map-get? delegated-power delegate))
+)
+
+(define-read-only (get-total-voting-power (user principal))
+    (let (
+        (own-balance (default-to u0 (map-get? token-balances user)))
+        (delegated (get total-delegated-tokens (get-delegated-power user)))
+    )
+        (+ own-balance delegated)
     )
 )
 
